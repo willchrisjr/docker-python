@@ -1,64 +1,108 @@
+import tempfile
 import os
+import shutil
 import subprocess
 import sys
-import tempfile
-import shutil
-import stat
+import tarfile
+import urllib.request
+import json
 
-def copy_dependencies(binary_path, temp_dir):
-    # Use ldd to find the shared libraries
-    result = subprocess.run(['ldd', binary_path], capture_output=True, text=True)
-    lines = result.stdout.splitlines()
-    
-    for line in lines:
-        parts = line.split()
-        if '=>' in parts:
-            lib_path = parts[2]
-        else:
-            lib_path = parts[0]
-        
-        if os.path.exists(lib_path):
-            dest_path = os.path.join(temp_dir, lib_path.lstrip('/'))
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-            shutil.copy(lib_path, dest_path)
+def get_docker_token(image_name):
+    # Get an authentication token for the specified Docker image from Docker Hub
+    url = f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/{image_name}:pull"
+    res = urllib.request.urlopen(url)
+    res_json = json.loads(res.read().decode())
+    return res_json["token"]
+
+def build_docker_headers(token):
+    # Generate HTTP headers for Docker API requests using the provided token
+    return {
+        "Accept": "application/vnd.docker.distribution.manifest.v2+json",
+        "Authorization": f"Bearer {token}",
+    }
+
+def get_docker_image_manifest(headers, image_name):
+    # Retrieve the image manifest from Docker Hub for the specified image
+    manifest_url = f"https://registry-1.docker.io/v2/library/{image_name}/manifests/latest"
+    request = urllib.request.Request(manifest_url, headers=headers)
+    res = urllib.request.urlopen(request)
+    res_json = json.loads(res.read().decode())
+    return res_json
+
+def get_image_layers(headers, image, layers):
+    # Download and extract the layers of the Docker image
+    dir_path = tempfile.mkdtemp()  # Create a temporary directory to store the layers
+
+    for layer in layers:
+        # Construct the URL to download the layer
+        url = f"https://registry-1.docker.io/v2/library/{image}/blobs/{layer['digest']}"
+        request = urllib.request.Request(url, headers=headers)
+        res = urllib.request.urlopen(request)
+
+        # Save the downloaded layer to a temporary file
+        tmp_file = os.path.join(dir_path, "layer.tar")
+        with open(tmp_file, "wb") as f:
+            shutil.copyfileobj(res, f)
+
+        # Extract the contents of the layer tarball
+        with tarfile.open(tmp_file) as tar:
+            def is_within_directory(directory, target):
+                # Ensure the target path is within the specified directory to prevent path traversal attacks
+                abs_directory = os.path.abspath(directory)
+                abs_target = os.path.abspath(target)
+                prefix = os.path.commonprefix([abs_directory, abs_target])
+                return prefix == abs_directory
+
+            def safe_extract(tar, path=".", members=None, *, numeric_owner=False):
+                # Safely extract the tarball contents to the specified path
+                for member in tar.getmembers():
+                    member_path = os.path.join(path, member.name)
+                    if not is_within_directory(path, member_path):
+                        raise Exception("Attempted Path Traversal in Tar File")
+                tar.extractall(path, members, numeric_owner=numeric_owner)
+
+            safe_extract(tar, dir_path)
+
+        os.remove(tmp_file)  # Remove the temporary file after extraction
+
+    return dir_path  # Return the path to the directory containing the extracted layers
 
 def main():
-    # Remove any debug print statements
+    if len(sys.argv) < 4:
+        print("Usage: mydocker run <image:tag> <command> [args...]")
+        sys.exit(1)
+
+    image = sys.argv[2]
     command = sys.argv[3]
     args = sys.argv[4:]
 
-    # Create a temporary directory
-    with tempfile.TemporaryDirectory() as temp_dir:
-        try:
-            # Copy the binary to the temporary directory
-            binary_path = shutil.copy(command, temp_dir)
-            
-            # Make the binary executable
-            os.chmod(binary_path, os.stat(binary_path).st_mode | stat.S_IEXEC)
-            
-            # Copy the necessary shared libraries
-            copy_dependencies(command, temp_dir)
-            
-            # Prepare the command to run in the new namespace and chroot
-            command_in_chroot = os.path.join("/", os.path.basename(binary_path))
-            unshare_command = ['unshare', '--pid', '--fork', '--mount-proc', '--']
-            chroot_command = ['chroot', temp_dir, command_in_chroot, *args]
-            
-            # Run the command in the new PID namespace and chroot
-            completed_process = subprocess.run(unshare_command + chroot_command, capture_output=True)
-            
-            # Print stdout and stderr
-            print(completed_process.stdout.decode("utf-8"), end='')
-            print(completed_process.stderr.decode("utf-8"), end='', file=sys.stderr)
-            
-            # Exit with the same code as the completed process
-            sys.exit(completed_process.returncode)
-        except FileNotFoundError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(2)
-        except Exception as e:
-            print(f"Unexpected error: {e}", file=sys.stderr)
-            sys.exit(1)
+    # Split the image name and tag (default to 'latest' if no tag is specified)
+    if ':' in image:
+        image_name, tag = image.split(':')
+    else:
+        image_name = image
+        tag = 'latest'
+
+    # Get an authentication token from Docker Hub
+    token = get_docker_token(image_name=image_name)
+    # Create HTTP headers for Docker API requests
+    headers = build_docker_headers(token)
+    # Retrieve the image manifest from Docker Hub
+    manifest = get_docker_image_manifest(headers, image_name)
+    # Download and extract the image layers
+    dir_path = get_image_layers(headers, image_name, manifest["layers"])
+
+    # Run the specified command in the isolated environment using 'unshare' and 'chroot'
+    completed_process = subprocess.run(
+        ["unshare", "-fpu", "chroot", dir_path, command, *args], capture_output=True
+    )
+
+    # Output the results of the command execution
+    sys.stderr.write(completed_process.stderr.decode("utf-8"))
+    sys.stdout.write(completed_process.stdout.decode("utf-8"))
+
+    # Exit with the return code of the executed command
+    sys.exit(completed_process.returncode)
 
 if __name__ == "__main__":
     main()
